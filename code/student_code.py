@@ -59,8 +59,22 @@ class CustomConv2DFunction(Function):
         # Fill in the code here
         #################################################################################
 
-        # save for backward (you need to save the unfolded tensor into ctx)
-        # ctx.save_for_backward(your_vars, weight, bias)
+        # Use unfold to extract patches from the input
+        patches = unfold(input_feats, kernel_size, stride=stride, padding=padding)
+        patches = patches.view(patches.size(0), -1, patches.size(-1))
+
+        # Perform matrix multiplication
+        output_unfolded = patches.matmul(weight.view(weight.size(0), -1).t()).transpose(1, 2)
+
+        # Add bias if present
+        if bias is not None:
+            output_unfolded += bias.view(1, -1, 1)
+
+        # Use fold to assemble the output
+        output = fold(output_unfolded, (ctx.input_height, ctx.input_width), 1, stride=stride)
+
+        # Save the tensors for backward computation
+        ctx.save_for_backward(input_feats, weight, bias, output)
 
         return output
 
@@ -79,7 +93,7 @@ class CustomConv2DFunction(Function):
 
         """
         # unpack tensors and initialize the grads
-        # your_vars, weight, bias = ctx.saved_tensors
+        your_vars, weight, bias = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
         # recover the conv params
@@ -93,7 +107,21 @@ class CustomConv2DFunction(Function):
         # Fill in the code here
         #################################################################################
         # compute the gradients w.r.t. input and params
+        # Use unfold to extract patches from the input
+        patches = unfold(input_feats, kernel_size, stride=stride, padding=padding)
+        patches = patches.view(patches.size(0), -1, patches.size(-1))
 
+        # Compute grad_input
+        # Flip the weights in both H and W dimensions
+        flipped_weights = weight.flip(-1).flip(-2)
+        grad_input_unfolded = grad_output.matmul(flipped_weights.view(flipped_weights.size(0), -1))
+        grad_input = fold(grad_input_unfolded.transpose(1, 2), (input_height, input_width), 1, stride=stride)
+
+        # Compute grad_weight
+        grad_output_unfolded = grad_output.unfold(2, kernel_size, stride=stride).unfold(3, kernel_size, stride=stride)
+        grad_output_unfolded = grad_output_unfolded.contiguous().view(grad_output_unfolded.size(0), grad_output_unfolded.size(1), -1).transpose(1, 2)
+        grad_weight = grad_output_unfolded.transpose(1, 2).matmul(patches).view_as(weight)
+        
         if bias is not None and ctx.needs_input_grad[2]:
             # compute the gradients w.r.t. bias (if any)
             grad_bias = grad_output.sum((0, 2, 3))
@@ -294,11 +322,31 @@ class SimpleViT(nn.Module):
         # the implementation shall start from embedding patches,
         # followed by some transformer blocks
 
-        if self.pos_embed is not None:
-            trunc_normal_(self.pos_embed, std=0.02)
-
+        self.patch_embed = PatchEmbed(
+        img_size=img_size, 
+        patch_size=patch_size, 
+        in_chans=in_chans, 
+        embed_dim=embed_dim
+        )
+        
+        # 2. Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                dim=embed_dim, 
+                num_heads=num_heads, 
+                mlp_ratio=mlp_ratio, 
+                qkv_bias=qkv_bias, 
+                drop_path=dpr[i]
+            )
+            for i in range(depth)
+        ])
+        
+        # 3. Classifier head
+        self.head = nn.Linear(embed_dim, num_classes)
+        
+        # Initialization
         self.apply(self._init_weights)
-        # add any necessary weight initialization here
+
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -310,10 +358,25 @@ class SimpleViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        ########################################################################
-        # Fill in the code here
-        ########################################################################
-        return x
+        # Splitting input into patches
+        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        x = x.contiguous().view(x.shape[0], -1, x.shape[4]*x.shape[5]*x.shape[6])
+
+        # Linearly embedding patches
+        x = self.embedding(x)
+
+        # Adding positional embeddings
+        if self.pos_embed is not None:
+            x += self.pos_embed
+
+        # Passing embedded patches through Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Classification token for output
+        x = x[:, 0]
+
+        return self.head(x)
 
 
 # change this to your model!
@@ -390,7 +453,13 @@ class PGDAttack(object):
         #################################################################################
         # Fill in the code here
         #################################################################################
-
+        for _ in range(self.num_steps):
+            output.requires_grad = True
+            logits = model(output)
+            loss = self.loss_fn(logits, logits.argmax(dim=1))
+            grad = torch.autograd.grad(loss, output)[0]
+            output = output.detach() + self.step_size * torch.sign(grad.detach())
+            output = torch.min(torch.max(output, input - self.epsilon), input + self.epsilon)
         return output
 
 
@@ -430,7 +499,10 @@ class GradAttention(object):
         #################################################################################
         # Fill in the code here
         #################################################################################
-
+        logits = model(input)
+        loss = self.loss_fn(logits, logits.argmax(dim=1))
+        grads = torch.autograd.grad(loss, input, create_graph=True)[0]
+        output = grads.abs().max(dim=1, keepdim=True)[0]
         return output
 
 
