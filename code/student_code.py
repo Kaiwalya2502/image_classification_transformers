@@ -4,9 +4,9 @@ import torch.nn as nn
 from torch.autograd import Function
 from torch.nn.modules.module import Module
 from torch.nn.functional import fold, unfold
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torchvision.utils import make_grid
 import math
-
 from utils import resize_image
 import custom_transforms as transforms
 from custom_blocks import PatchEmbed, TransformerBlock, trunc_normal_
@@ -56,30 +56,27 @@ class CustomConv2DFunction(Function):
         assert kernel_size <= (input_feats.size(3) + 2 * padding)
 
         #################################################################################
-        # Fill in the code here
+        if padding > 0:
+            input_feats = nn.functional.pad(input_feats, (padding, padding, padding, padding))
+        unfold_input = unfold(input_feats, kernel_size, stride=stride)
+        new_weight = weight.view(weight.size(0), -1)
+        output = new_weight @ unfold_input
+        if bias is not None:
+            output += bias.unsqueeze(1)
+        H = (ctx.input_height - kernel_size + 2 * padding) // stride + 1
+        W = (ctx.input_width - kernel_size + 2 * padding) // stride + 1
+        output = output.view(input_feats.size(0), weight.size(0), H, W).clone()
+
         #################################################################################
 
-        # Use unfold to extract patches from the input
-        patches = unfold(input_feats, kernel_size, stride=stride, padding=padding)
-        patches = patches.view(patches.size(0), -1, patches.size(-1))
-
-        # Perform matrix multiplication
-        output_unfolded = patches.matmul(weight.view(weight.size(0), -1).t()).transpose(1, 2)
-
-        # Add bias if present
-        if bias is not None:
-            output_unfolded += bias.view(1, -1, 1)
-
-        # Use fold to assemble the output
-        output = fold(output_unfolded, (ctx.input_height, ctx.input_width), 1, stride=stride)
-
-        # Save the tensors for backward computation
-        ctx.save_for_backward(input_feats, weight, bias, output)
+        # save for backward (you need to save the unfolded tensor into ctx)
+        ctx.save_for_backward(unfold_input, weight, bias)
 
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
+        
         """
         Backward propagation of convolution operation
 
@@ -93,7 +90,7 @@ class CustomConv2DFunction(Function):
 
         """
         # unpack tensors and initialize the grads
-        your_vars, weight, bias = ctx.saved_tensors
+        unfold_input, weight, bias = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
         # recover the conv params
@@ -104,24 +101,25 @@ class CustomConv2DFunction(Function):
         input_width = ctx.input_width
 
         #################################################################################
-        # Fill in the code here
+        C_i = weight.size(1)
+    
+        if ctx.needs_input_grad[0]:
+            C_o = weight.size(0)
+            new_weight = weight.view(C_o, C_i * kernel_size * kernel_size).T
+            new_grad_output = grad_output.view(grad_output.size(0),
+                                                grad_output.size(1), -1).permute(0, 2, 1)
+            new_grad_input = new_grad_output @ new_weight.T
+            new_grad_input = new_grad_input.permute(0, 2, 1)
+            grad_input = fold(new_grad_input, (input_height, input_width), (kernel_size, kernel_size), padding=padding, stride=stride)
+
+        if ctx.needs_input_grad[1]:
+            new_grad_output = grad_output.view(grad_output.size(0),
+                                                grad_output.size(1), -1)
+            grad_weight = new_grad_output @ unfold_input.permute(0, 2, 1)
+            grad_weight = grad_weight.sum(dim=0).view_as(weight)
         #################################################################################
         # compute the gradients w.r.t. input and params
-        # Use unfold to extract patches from the input
-        patches = unfold(input_feats, kernel_size, stride=stride, padding=padding)
-        patches = patches.view(patches.size(0), -1, patches.size(-1))
 
-        # Compute grad_input
-        # Flip the weights in both H and W dimensions
-        flipped_weights = weight.flip(-1).flip(-2)
-        grad_input_unfolded = grad_output.matmul(flipped_weights.view(flipped_weights.size(0), -1))
-        grad_input = fold(grad_input_unfolded.transpose(1, 2), (input_height, input_width), 1, stride=stride)
-
-        # Compute grad_weight
-        grad_output_unfolded = grad_output.unfold(2, kernel_size, stride=stride).unfold(3, kernel_size, stride=stride)
-        grad_output_unfolded = grad_output_unfolded.contiguous().view(grad_output_unfolded.size(0), grad_output_unfolded.size(1), -1).transpose(1, 2)
-        grad_weight = grad_output_unfolded.transpose(1, 2).matmul(patches).view_as(weight)
-        
         if bias is not None and ctx.needs_input_grad[2]:
             # compute the gradients w.r.t. bias (if any)
             grad_bias = grad_output.sum((0, 2, 3))
@@ -317,36 +315,39 @@ class SimpleViT(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
         ########################################################################
-        # Fill in the code here
+        self.patch_embed = PatchEmbed(
+            in_chans = in_chans,
+            embed_dim = embed_dim,
+            kernel_size = (patch_size, patch_size),
+            stride = (patch_size, patch_size),
+        )
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                window_size=window_size if i in window_block_indexes else 0
+            )
+            for i in range(depth)
+        ])
+        self.head = nn.Linear(embed_dim, num_classes)
+        
+        if self.pos_embed is not None:
+            trunc_normal_(self.pos_embed, std=0.02)
+        self.apply(self._init_weights)
         ########################################################################
         # the implementation shall start from embedding patches,
         # followed by some transformer blocks
 
-        self.patch_embed = PatchEmbed(
-        img_size=img_size, 
-        patch_size=patch_size, 
-        in_chans=in_chans, 
-        embed_dim=embed_dim
-        )
-        
-        # 2. Transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                dim=embed_dim, 
-                num_heads=num_heads, 
-                mlp_ratio=mlp_ratio, 
-                qkv_bias=qkv_bias, 
-                drop_path=dpr[i]
-            )
-            for i in range(depth)
-        ])
-        
-        # 3. Classifier head
-        self.head = nn.Linear(embed_dim, num_classes)
-        
-        # Initialization
-        self.apply(self._init_weights)
+        if self.pos_embed is not None:
+            trunc_normal_(self.pos_embed, std=0.02)
 
+        self.apply(self._init_weights)
+        # add any necessary weight initialization here
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -358,26 +359,19 @@ class SimpleViT(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        # Splitting input into patches
-        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-        x = x.contiguous().view(x.shape[0], -1, x.shape[4]*x.shape[5]*x.shape[6])
-
-        # Linearly embedding patches
-        x = self.embedding(x)
-
-        # Adding positional embeddings
+        ########################################################################
+        x = self.patch_embed(x)
         if self.pos_embed is not None:
-            x += self.pos_embed
+            x = x + self.pos_embed
 
-        # Passing embedded patches through Transformer blocks
         for block in self.blocks:
             x = block(x)
-
-        # Classification token for output
-        x = x[:, 0]
-
-        return self.head(x)
-
+            
+        x = x.mean(dim=(1, 2))
+        x = self.head(x)
+        
+        ########################################################################
+        return x
 
 # change this to your model!
 default_cnn_model = SimpleNet
@@ -406,7 +400,6 @@ def get_val_transforms(normalize):
     val_transforms.append(normalize)
     val_transforms = transforms.Compose(val_transforms)
     return val_transforms
-
 
 #################################################################################
 # Part III: Adversarial samples and Attention
