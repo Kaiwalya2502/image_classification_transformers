@@ -373,9 +373,73 @@ class SimpleViT(nn.Module):
         ########################################################################
         return x
 
+class EnhancedSimpleViT(nn.Module):
+    def __init__(
+        self,
+        img_size=128,
+        num_classes=100,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=192,
+        depth=6,  # Increased depth
+        num_heads=4,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_path_rate=0.1,
+        norm_layer=nn.LayerNorm,
+        act_layer=nn.GELU,
+        use_abs_pos=True,
+        window_size=4,
+        window_block_indexes=(0, 2, 4),  # Updated for increased depth
+    ):
+        super(EnhancedSimpleViT, self).__init__()
+
+        if use_abs_pos:
+            self.pos_embed = nn.Parameter(
+                torch.zeros(
+                    1, img_size // patch_size, img_size // patch_size, embed_dim
+                )
+            )
+        else:
+            self.pos_embed = None
+
+        # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        self.patch_embed = PatchEmbed(
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+        )
+        
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                TransformerBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer,
+                    act_layer=act_layer,
+                    window_size=window_size if i in window_block_indexes else 0
+                ),
+                nn.BatchNorm2d(embed_dim)  # Added Batch Normalization
+            )
+            for i in range(depth)
+        ])
+        
+        self.head = nn.Linear(embed_dim, num_classes)
+        
+        if self.pos_embed is not None:
+            trunc_normal_(self.pos_embed, std=0.02)
+        self.apply(self._init_weights)
+
+
 # change this to your model!
 default_cnn_model = SimpleNet
-default_vit_model = SimpleViT
+default_vit_model = EnhancedSimpleViT
 
 # define data augmentation used for training, you can tweak things if you want
 def get_train_transforms(normalize):
