@@ -373,73 +373,68 @@ class SimpleViT(nn.Module):
         ########################################################################
         return x
 
-class EnhancedSimpleViT(nn.Module):
-    def __init__(
-        self,
-        img_size=128,
-        num_classes=100,
-        patch_size=16,
-        in_chans=3,
-        embed_dim=192,
-        depth=6,  # Increased depth
-        num_heads=4,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop_path_rate=0.1,
-        norm_layer=nn.LayerNorm,
-        act_layer=nn.GELU,
-        use_abs_pos=True,
-        window_size=4,
-        window_block_indexes=(0, 2, 4),  # Updated for increased depth
-    ):
-        super(EnhancedSimpleViT, self).__init__()
+class SimpleNetBN(nn.Module):
+    # A simple CNN with batch normalization for image classification
+    def __init__(self, conv_op=nn.Conv2d, num_classes=100):
+        super(SimpleNetBN, self).__init__()
 
-        if use_abs_pos:
-            self.pos_embed = nn.Parameter(
-                torch.zeros(
-                    1, img_size // patch_size, img_size // patch_size, embed_dim
-                )
-            )
-        else:
-            self.pos_embed = None
-
-        # stochastic depth decay rule
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-
-        self.patch_embed = PatchEmbed(
-            in_chans=in_chans,
-            embed_dim=embed_dim,
-            kernel_size=(patch_size, patch_size),
-            stride=(patch_size, patch_size),
+        self.features = nn.Sequential(
+            # conv1 block: conv 7x7
+            conv_op(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm2d(64),  # Added BatchNorm
+            nn.ReLU(inplace=True),
+            # max pooling 1/2
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            # conv2 block: simple bottleneck
+            conv_op(64, 64, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(64),  # Added BatchNorm
+            nn.ReLU(inplace=True),
+            conv_op(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),  # Added BatchNorm
+            nn.ReLU(inplace=True),
+            conv_op(64, 256, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(256),  # Added BatchNorm
+            nn.ReLU(inplace=True),
+            # max pooling 1/2
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            # conv3 block: simple bottleneck
+            conv_op(256, 128, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(128),  # Added BatchNorm
+            nn.ReLU(inplace=True),
+            conv_op(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),  # Added BatchNorm
+            nn.ReLU(inplace=True),
+            conv_op(128, 512, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(512),  # Added BatchNorm
+            nn.ReLU(inplace=True),
         )
         
-        self.blocks = nn.ModuleList([
-            nn.Sequential(
-                TransformerBlock(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    drop_path=dpr[i],
-                    norm_layer=norm_layer,
-                    act_layer=act_layer,
-                    window_size=window_size if i in window_block_indexes else 0
-                ),
-                nn.BatchNorm2d(embed_dim)  # Added Batch Normalization
-            )
-            for i in range(depth)
-        ])
-        
-        self.head = nn.Linear(embed_dim, num_classes)
-        
-        if self.pos_embed is not None:
-            trunc_normal_(self.pos_embed, std=0.02)
-        self.apply(self._init_weights)
+        # global avg pooling + FC
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+
+    def reset_parameters(self):
+        # init all params
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
 
 
 # change this to your model!
-default_cnn_model = SimpleNet
-default_vit_model = EnhancedSimpleViT
+default_cnn_model = SimpleNetBN
+default_vit_model = SimpleViT
 
 # define data augmentation used for training, you can tweak things if you want
 def get_train_transforms(normalize):
